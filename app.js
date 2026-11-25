@@ -160,13 +160,17 @@ async function showHome(prefillCode = '') {
 
 // ------------------------------------------------------------------ create
 
-function settingsFields(g = {}) {
+// locked = approval is on and play has started: money rules can't be loosened
+function settingsFields(g = {}, locked = false) {
+  const dis = locked ? 'disabled' : '';
   return `
     <div class="grid-2">
       <label class="field"><span>Currency symbol</span><input name="currency" maxlength="4" required value="${esc(g.currency ?? '$')}"></label>
-      <label class="field"><span>Passing GO pays</span><input name="go" inputmode="numeric" class="amt" required value="${esc(num(g.go_amount ?? 200))}"></label>
+      <label class="field"><span>Passing GO pays</span><input name="go" inputmode="numeric" class="amt" required ${dis} value="${esc(num(g.go_amount ?? 200))}"></label>
     </div>
-    <label class="field"><span>Starting money per player</span><input name="start" inputmode="numeric" class="amt" required value="${esc(num(g.starting_balance ?? 1500))}"></label>
+    <label class="field"><span>Starting money per player</span><input name="start" inputmode="numeric" class="amt" required ${dis} value="${esc(num(g.starting_balance ?? 1500))}"></label>
+    <label class="toggle"><input type="checkbox" name="require_approval" ${dis} ${(g.require_approval ?? true) ? 'checked' : ''}>
+      <span><strong>Approve bank payouts</strong><br><span class="muted small">Money from the bank or pot needs the banker's OK. The banker's own payouts need another player's OK.${locked ? ' Locked once play starts, along with GO and starting money.' : ''}</span></span></label>
     <label class="toggle"><input type="checkbox" name="free_parking" ${g.free_parking ? 'checked' : ''}>
       <span><strong>Free Parking pot</strong><br><span class="muted small">Taxes and fines can go into a pot someone collects</span></span></label>
     <label class="toggle"><input type="checkbox" name="allow_negative" ${g.allow_negative ? 'checked' : ''}>
@@ -175,15 +179,19 @@ function settingsFields(g = {}) {
       <textarea name="rules" maxlength="4000" placeholder="e.g. Land exactly on GO = double. Auctions on. No rent while in jail.">${esc(g.rules_notes ?? '')}</textarea></label>
   `;
 }
+// disabled (locked) fields are sent as null = "leave unchanged"
 function readSettings(form) {
-  const fd = new FormData(form);
+  const f = form.elements;
+  const amount = (el) => (el.disabled ? null : parseAmount(el.value));
+  const check = (el) => (el.disabled ? null : el.checked);
   return {
-    p_currency: String(fd.get('currency')).trim(),
-    p_starting: parseAmount(fd.get('start')),
-    p_go: parseAmount(fd.get('go')),
-    p_free_parking: fd.get('free_parking') === 'on',
-    p_allow_negative: fd.get('allow_negative') === 'on',
-    p_rules: String(fd.get('rules') ?? ''),
+    p_currency: f.currency.value.trim(),
+    p_starting: amount(f.start),
+    p_go: amount(f.go),
+    p_free_parking: check(f.free_parking),
+    p_allow_negative: check(f.allow_negative),
+    p_require_approval: check(f.require_approval),
+    p_rules: f.rules.value,
   };
 }
 
@@ -306,8 +314,9 @@ function renderGame() {
   if (!g || !me) return;
   const banker = isBanker();
   const hostPlayer = state.players.find((p) => p.user_id === g.host_id);
-  const incoming = state.requests.filter((r) => r.payer === me.id);
-  const outgoing = state.requests.filter((r) => r.requester === me.id);
+  // mine to approve first, then my own, then everyone else's (for transparency)
+  const rank = (r) => (approversOf(r).includes(me.id) ? 0 : r.requester === me.id ? 1 : 2);
+  const pending = [...state.requests].sort((a, b) => rank(a) - rank(b) || a.id - b.id);
 
   app.innerHTML = `
     <div class="topbar">
@@ -322,21 +331,11 @@ function renderGame() {
       <div class="amount ${me.balance < 0 ? 'neg' : ''}">${esc(money(me.balance))}</div>
     </section>
 
-    ${incoming.map((r) => `
-      <div class="request">
-        <div class="grow"><strong>${esc(partyName('player', r.requester))}</strong> asks for <strong>${esc(money(r.amount))}</strong>${r.note ? ` <span class="small">· ${esc(r.note)}</span>` : ''}</div>
-        <button class="btn primary" data-pay-req="${r.id}">Pay</button>
-        <button class="btn" data-decline-req="${r.id}" aria-label="Decline">✕</button>
-      </div>`).join('')}
-    ${outgoing.map((r) => `
-      <div class="request">
-        <div class="grow small">Waiting for <strong>${esc(partyName('player', r.payer))}</strong> to pay <strong>${esc(money(r.amount))}</strong>${r.note ? ` · ${esc(r.note)}` : ''}</div>
-        <button class="btn" data-decline-req="${r.id}">Cancel</button>
-      </div>`).join('')}
+    ${pending.map((r) => requestRow(r)).join('')}
 
     <div class="actions">
       <button class="action go" id="a-go"><span class="ico">➜</span><strong>Pass GO</strong><small>+${esc(money(g.go_amount))}</small></button>
-      <button class="action" id="a-collect"><span class="ico">🏦</span><strong>Collect from bank</strong><small>Get money</small></button>
+      <button class="action" id="a-collect"><span class="ico">🏦</span><strong>Collect from bank</strong><small>${g.require_approval ? (banker ? 'Another player approves' : 'Banker approves') : 'Get money'}</small></button>
       <button class="action" id="a-paybank"><span class="ico">💸</span><strong>Pay the bank</strong><small>Buy, tax, fines</small></button>
       <button class="action" id="a-payplayer"><span class="ico">🤝</span><strong>Pay a player</strong><small>Rent, trades</small></button>
       <button class="action" id="a-request"><span class="ico">📨</span><strong>Request money</strong><small>They tap to pay</small></button>
@@ -381,19 +380,69 @@ function renderGame() {
   $('#a-history')?.addEventListener('click', () => $('#activity').scrollIntoView({ behavior: 'smooth' }));
   $('#a-banker')?.addEventListener('click', () => bankerSheet());
   $$('[data-player]').forEach((b) => (b.onclick = () => playerSheet(b.dataset.player)));
-  $$('[data-pay-req]').forEach((b) => (b.onclick = busy(b, async () => {
-    await rpc('respond_request', { p_request: Number(b.dataset.payReq), p_accept: true });
-    toast('Paid');
+  $$('[data-approve-req]').forEach((b) => (b.onclick = busy(b, async () => {
+    await rpc('respond_request', { p_request: Number(b.dataset.approveReq), p_accept: true });
+    toast('Done');
   })));
-  $$('[data-decline-req]').forEach((b) => (b.onclick = busy(b, async () => {
-    await rpc('respond_request', { p_request: Number(b.dataset.declineReq), p_accept: false });
+  $$('[data-reject-req]').forEach((b) => (b.onclick = busy(b, async () => {
+    await rpc('respond_request', { p_request: Number(b.dataset.rejectReq), p_accept: false });
   })));
   $$('[data-undo]').forEach((b) => (b.onclick = busy(b, async () => {
     const t = state.txs.find((x) => x.id === Number(b.dataset.undo));
     if (!t || !confirm(`Undo ${partyName(t.from_type, t.from_player)} → ${partyName(t.to_type, t.to_player)} ${money(t.amount)}?`)) return;
-    await rpc('undo_transaction', { p_tx: t.id });
-    toast('Undone');
+    const res = await rpc('undo_transaction', { p_tx: t.id });
+    toast(res === 'pending' ? 'Undo sent for approval' : 'Undone');
   })));
+}
+
+// Mirrors public._approvers() in schema.sql (the server has the final say).
+function approversOf(r) {
+  const ids = state.players.map((p) => p.id);
+  if (r.reverses) return ids.filter((id) => id !== r.requester);
+  if (r.from_type === 'player') return [r.from_player];
+  const bankerId = state.players.find((p) => p.user_id === state.game.host_id)?.id;
+  if (bankerId && bankerId !== r.requester && bankerId !== r.to_player) return [bankerId];
+  const others = ids.filter((id) => id !== r.requester && id !== r.to_player && id !== bankerId);
+  if (!others.length && r.to_player && r.to_player !== r.requester) return [r.to_player];
+  return others;
+}
+
+function requestRow(r) {
+  const me = state.me;
+  const who = (id) => (id === me.id ? 'you' : partyName('player', id));
+  const req = r.requester === me.id ? 'You' : partyName('player', r.requester);
+  const amt = `<strong>${esc(money(r.amount))}</strong>`;
+  const note = r.note && !r.reverses ? ` <span class="small">· ${esc(r.note)}</span>` : '';
+  let text;
+  if (r.reverses) {
+    text = `${esc(req)} want${req === 'You' ? '' : 's'} to undo ${esc(partyName(r.to_type, r.to_player))} → ${esc(partyName(r.from_type, r.from_player))} ${amt}`;
+  } else if (r.from_type === 'player') {
+    text = `${esc(req)} asked ${esc(who(r.from_player))} for ${amt}`;
+  } else {
+    const src = r.from_type === 'pot' ? 'the pot' : 'the bank';
+    const forWhom = r.to_type === 'player' && r.to_player !== r.requester ? ` for ${esc(who(r.to_player))}` : '';
+    const dest = r.to_type !== 'player' ? ` to ${r.to_type === 'pot' ? 'the pot' : 'the bank'}` : '';
+    text = `${esc(req)} want${req === 'You' ? '' : 's'} ${amt} from ${src}${forWhom}${dest}`;
+  }
+
+  const approvers = approversOf(r);
+  const canApprove = approvers.includes(me.id);
+  const mine = r.requester === me.id;
+  let waiting = '';
+  if (!canApprove) {
+    const names = approvers.map((id) => partyName('player', id));
+    waiting = `<div class="small" style="opacity:.8">Waiting for ${esc(
+      !names.length ? 'another player to join' : names.length === 1 ? names[0] : names.length > 2 ? 'any other player' : names.join(' or ')
+    )}</div>`;
+  }
+  const approveLabel = r.from_type === 'player' && r.from_player === me.id && !r.reverses ? 'Pay' : 'Approve';
+  return `
+    <div class="request">
+      <div class="grow">${text}${note}${waiting}</div>
+      ${canApprove ? `<button class="btn primary" data-approve-req="${r.id}">${approveLabel}</button>
+                      <button class="btn" data-reject-req="${r.id}" aria-label="Reject">✕</button>` : ''}
+      ${mine && !canApprove ? `<button class="btn" data-reject-req="${r.id}">Cancel</button>` : ''}
+    </div>`;
 }
 
 function txRow(t) {
@@ -402,8 +451,10 @@ function txRow(t) {
   const outbound = t.from_type === 'player' && t.from_player === me.id;
   const by = playerById(t.created_by);
   const actor = t.from_type === 'player' ? t.from_player : t.to_type === 'player' ? t.to_player : null;
-  const byLine = by && t.created_by !== actor ? ` · by ${by.name}` : '';
-  const canUndo = t.kind === 'normal' && !t.reversed_by && (t.created_by === me.id || isBanker());
+  const approver = playerById(t.approved_by);
+  const byLine = (by && t.created_by !== actor ? ` · by ${by.name}` : '') + (approver ? ` · ✓ ${approver.name}` : '');
+  const undoPending = state.requests.some((r) => r.reverses === t.id);
+  const canUndo = t.kind === 'normal' && !t.reversed_by && !undoPending && (t.created_by === me.id || isBanker());
   return `
     <div class="tx ${t.reversed_by ? 'reversed' : ''}">
       <div class="grow">
@@ -427,7 +478,7 @@ async function transfer(fromType, from, toType, to, amount, note) {
 async function passGo() {
   const g = state.game;
   if (!g.go_amount) return toast('Passing GO pays nothing in this game');
-  await transfer('bank', null, 'player', state.me.id, g.go_amount, 'Passed GO');
+  await rpc('pass_go', { p_game: g.id });
   toast(`+${money(g.go_amount)} for passing GO`);
 }
 
@@ -510,9 +561,10 @@ function amountSheet({ title, confirm, notes = [], pick = null, pickLabel = 'Who
         const [tt, tid] = form.to.value.split(':');
         extra = { ft, fid: fid || null, tt, tid: tid || null };
       }
-      await submit(a, form.note.value.trim(), picked, extra);
+      const res = await submit(a, form.note.value.trim(), picked, extra);
       closeSheet();
-      if (done) toast(done(a, picked, extra));
+      if (res === 'pending') toast('Sent for approval');
+      else if (done) toast(done(a, picked, extra));
     })();
   };
 }
@@ -549,9 +601,9 @@ function potSheet() {
       <button class="btn block big" id="pot-pay">Pay into the pot</button>
     </div>`);
   $('#pot-collect', el).onclick = busy($('#pot-collect', el), async () => {
-    await transfer('pot', null, 'player', state.me.id, g.pot, 'Free Parking');
+    const res = await transfer('pot', null, 'player', state.me.id, g.pot, 'Free Parking');
     closeSheet();
-    toast(`+${money(g.pot)} from the pot`);
+    toast(res === 'pending' ? 'Sent for approval' : `+${money(g.pot)} from the pot`);
   });
   $('#pot-pay', el).onclick = () => amountSheet({
     title: 'Pay into the pot', confirm: 'Pay', notes: NOTES.pot,
@@ -613,6 +665,7 @@ function rulesSheet() {
         <dt>Currency</dt><dd>${esc(g.currency)}</dd>
         <dt>Starting money</dt><dd>${esc(money(g.starting_balance))}</dd>
         <dt>Passing GO</dt><dd>${esc(money(g.go_amount))}</dd>
+        <dt>Approve bank payouts</dt><dd>${g.require_approval ? 'On' : 'Off'}</dd>
         <dt>Free Parking pot</dt><dd>${g.free_parking ? 'On' : 'Off'}</dd>
         <dt>Negative balances</dt><dd>${g.allow_negative ? 'Allowed' : 'Not allowed'}</dd>
       </dl>
@@ -626,7 +679,7 @@ function rulesSheet() {
       <form class="stack" id="rules-form">
         <h2>Edit rules</h2>
         <label class="field"><span>Game name</span><input name="game_name" maxlength="40" value="${esc(g.name)}"></label>
-        ${settingsFields(g)}
+        ${settingsFields(g, g.require_approval && state.txs.some((t) => t.kind !== 'start'))}
         <p class="muted small">Changing starting money only affects players who join after this.</p>
         <button class="btn primary block big" type="submit">Save</button>
       </form>`);

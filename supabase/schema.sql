@@ -1,7 +1,11 @@
--- Pocket Banker schema
+-- Pocket Banker schema (re-runnable)
 -- All money movement happens through SECURITY DEFINER functions so balances
 -- can't be edited directly from the browser. Clients may only SELECT rows for
 -- games they are a player in.
+--
+-- Approval mode (games.require_approval): any move that takes money out of
+-- the bank, the pot, or someone else's balance becomes a pending request that
+-- someone else must approve. Paying out of your own balance is always instant.
 
 create extension if not exists pgcrypto;
 
@@ -17,10 +21,12 @@ create table if not exists public.games (
   free_parking     boolean not null default false,
   pot              bigint not null default 0 check (pot >= 0),
   allow_negative   boolean not null default false,
+  require_approval boolean not null default false,
   rules_notes      text not null default '',
   host_id          uuid not null references auth.users(id),
   created_at       timestamptz not null default now()
 );
+alter table public.games add column if not exists require_approval boolean not null default false;
 
 create table if not exists public.players (
   id         uuid primary key default gen_random_uuid(),
@@ -46,20 +52,28 @@ create table if not exists public.transactions (
   note        text,
   kind        text not null default 'normal' check (kind in ('normal','start','reversal')),
   created_by  uuid references public.players(id) on delete set null,
+  approved_by uuid references public.players(id) on delete set null,
   reverses    bigint references public.transactions(id) on delete set null,
   reversed_by bigint references public.transactions(id) on delete set null,
   created_at  timestamptz not null default now()
 );
+alter table public.transactions add column if not exists approved_by uuid references public.players(id) on delete set null;
 create index if not exists transactions_game_idx on public.transactions (game_id, id desc);
 
+-- A pending money move waiting for someone else's OK.
 create table if not exists public.payment_requests (
   id          bigint generated always as identity primary key,
   game_id     uuid not null references public.games(id) on delete cascade,
   requester   uuid not null references public.players(id) on delete cascade,
-  payer       uuid not null references public.players(id) on delete cascade,
+  from_type   text not null check (from_type in ('bank','pot','player')),
+  from_player uuid references public.players(id) on delete cascade,
+  to_type     text not null check (to_type in ('bank','pot','player')),
+  to_player   uuid references public.players(id) on delete cascade,
   amount      bigint not null check (amount > 0),
   note        text,
-  status      text not null default 'pending' check (status in ('pending','paid','declined','cancelled')),
+  reverses    bigint references public.transactions(id) on delete cascade,
+  status      text not null default 'pending' check (status in ('pending','approved','rejected','cancelled')),
+  resolved_by uuid references public.players(id) on delete set null,
   created_at  timestamptz not null default now(),
   resolved_at timestamptz
 );
@@ -89,6 +103,13 @@ create policy req_select on public.payment_requests for select to authenticated 
 revoke all on public.games, public.players, public.transactions, public.payment_requests from anon, authenticated;
 grant select on public.games, public.players, public.transactions, public.payment_requests to authenticated;
 
+-- ---------------------------------------------------------------- old signatures
+
+drop function if exists public.create_game(text, text, text, bigint, bigint, boolean, boolean, text);
+drop function if exists public.update_game(uuid, text, text, bigint, bigint, boolean, boolean, text);
+drop function if exists public.transfer(uuid, text, uuid, text, uuid, bigint, text);
+drop function if exists public.undo_transaction(bigint);
+
 -- ---------------------------------------------------------------- internals
 
 -- Moves money between parties. Locks the game row first so every money
@@ -98,15 +119,15 @@ create or replace function public._apply_move(
   p_amount bigint, p_check boolean
 ) returns void language plpgsql security definer set search_path = '' as $$
 declare
-  v_allow boolean; v_pot bigint; v_bal bigint;
+  v_allow boolean; v_pot bigint; v_bal bigint; v_name text;
 begin
   select allow_negative, pot into v_allow, v_pot from public.games where id = p_game for update;
 
   if p_from_type = 'player' then
-    select balance into v_bal from public.players where id = p_from and game_id = p_game for update;
+    select balance, name into v_bal, v_name from public.players where id = p_from and game_id = p_game for update;
     if not found then raise exception 'Player not found'; end if;
     if p_check and not v_allow and v_bal < p_amount then
-      raise exception 'Not enough money (balance is %)', v_bal;
+      raise exception '% doesn''t have enough money (balance is %)', v_name, v_bal;
     end if;
     update public.players set balance = balance - p_amount where id = p_from;
   elsif p_from_type = 'pot' then
@@ -147,11 +168,77 @@ begin
   return v_id;
 end $$;
 
+-- Who may approve a pending request (player ids).
+--  * undo:                     anyone except the person asking
+--  * money from a player:      that player
+--  * money from bank / pot:    the banker, unless the banker asked for it or
+--                              receives it; then any other player
+create or replace function public._approvers(r public.payment_requests)
+returns uuid[] language plpgsql stable security definer set search_path = '' as $$
+declare v_banker uuid; v_ids uuid[];
+begin
+  if r.reverses is not null then
+    select coalesce(array_agg(id), '{}') into v_ids from public.players
+      where game_id = r.game_id and id <> r.requester;
+    return v_ids;
+  end if;
+  if r.from_type = 'player' then return array[r.from_player]; end if;
+
+  select p.id into v_banker from public.players p
+    join public.games g on g.id = p.game_id and g.host_id = p.user_id
+    where g.id = r.game_id;
+  if v_banker is not null and v_banker <> r.requester and v_banker is distinct from r.to_player then
+    return array[v_banker];
+  end if;
+  select coalesce(array_agg(id), '{}') into v_ids from public.players
+    where game_id = r.game_id and id <> r.requester
+      and id is distinct from r.to_player and id is distinct from v_banker;
+  if cardinality(v_ids) = 0 and r.to_player is not null and r.to_player <> r.requester then
+    return array[r.to_player];  -- 2-player game: the only other person
+  end if;
+  return v_ids;
+end $$;
+
+-- True once anything other than starting money has happened.
+create or replace function public._play_started(p_game uuid)
+returns boolean language sql stable security definer set search_path = '' as $$
+  select exists (select 1 from public.transactions where game_id = p_game and kind <> 'start');
+$$;
+
+create or replace function public._create_request(
+  p_game uuid, p_requester uuid, p_from_type text, p_from uuid, p_to_type text, p_to uuid,
+  p_amount bigint, p_note text, p_reverses bigint
+) returns bigint language plpgsql security definer set search_path = '' as $$
+declare v_id bigint;
+begin
+  insert into public.payment_requests (game_id, requester, from_type, from_player, to_type, to_player, amount, note, reverses)
+  values (p_game, p_requester, p_from_type, p_from, p_to_type, p_to, p_amount,
+          nullif(left(btrim(coalesce(p_note, '')), 80), ''), p_reverses)
+  returning id into v_id;
+  return v_id;
+end $$;
+
+create or replace function public._record(
+  p_game uuid, p_from_type text, p_from uuid, p_to_type text, p_to uuid,
+  p_amount bigint, p_note text, p_kind text, p_by uuid, p_approved_by uuid, p_reverses bigint
+) returns bigint language plpgsql security definer set search_path = '' as $$
+declare v_id bigint;
+begin
+  insert into public.transactions (game_id, from_type, from_player, to_type, to_player, amount, note, kind, created_by, approved_by, reverses)
+  values (p_game, p_from_type, p_from, p_to_type, p_to, p_amount,
+          nullif(left(btrim(coalesce(p_note, '')), 80), ''), p_kind, p_by, p_approved_by, p_reverses)
+  returning id into v_id;
+  if p_reverses is not null then
+    update public.transactions set reversed_by = v_id where id = p_reverses;
+  end if;
+  return v_id;
+end $$;
+
 -- ---------------------------------------------------------------- RPCs
 
 create or replace function public.create_game(
   p_game_name text, p_player_name text, p_currency text, p_starting bigint, p_go bigint,
-  p_free_parking boolean, p_allow_negative boolean, p_rules text
+  p_free_parking boolean, p_allow_negative boolean, p_require_approval boolean, p_rules text
 ) returns text language plpgsql security definer set search_path = '' as $$
 declare
   v_chars text := 'ABCDEFGHJKLMNPQRSTUVWXYZ';
@@ -167,10 +254,10 @@ begin
     end loop;
     exit when not exists (select 1 from public.games where code = v_code);
   end loop;
-  insert into public.games (code, name, currency, starting_balance, go_amount, free_parking, allow_negative, rules_notes, host_id)
+  insert into public.games (code, name, currency, starting_balance, go_amount, free_parking, allow_negative, require_approval, rules_notes, host_id)
   values (v_code, coalesce(nullif(btrim(p_game_name), ''), 'Game night'), left(coalesce(nullif(btrim(p_currency), ''), '$'), 4),
           p_starting, p_go, coalesce(p_free_parking, false), coalesce(p_allow_negative, false),
-          left(coalesce(p_rules, ''), 4000), auth.uid())
+          coalesce(p_require_approval, true), left(coalesce(p_rules, ''), 4000), auth.uid())
   returning id into v_game;
   perform public._add_player(v_game, p_player_name);
   return v_code;
@@ -189,15 +276,25 @@ begin
   return v_code;
 end $$;
 
+-- Null arguments leave a setting unchanged.
 create or replace function public.update_game(
   p_game uuid, p_name text, p_currency text, p_starting bigint, p_go bigint,
-  p_free_parking boolean, p_allow_negative boolean, p_rules text
+  p_free_parking boolean, p_allow_negative boolean, p_require_approval boolean, p_rules text
 ) returns void language plpgsql security definer set search_path = '' as $$
+declare g public.games;
 begin
-  if not exists (select 1 from public.games where id = p_game and host_id = auth.uid()) then
-    raise exception 'Only the banker can change the rules';
-  end if;
+  select * into g from public.games where id = p_game and host_id = auth.uid();
+  if not found then raise exception 'Only the banker can change the rules'; end if;
   if p_starting < 0 or p_go < 0 then raise exception 'Amounts must be 0 or more'; end if;
+  -- with approval on, the banker can't loosen money rules once play has started
+  if g.require_approval and public._play_started(p_game) then
+    if p_require_approval = false then
+      raise exception 'Approval can''t be turned off once play has started';
+    end if;
+    if (p_go is not null and p_go <> g.go_amount) or (p_starting is not null and p_starting <> g.starting_balance) then
+      raise exception 'GO and starting money are locked once play has started';
+    end if;
+  end if;
   update public.games set
     name = coalesce(nullif(btrim(p_name), ''), name),
     currency = left(coalesce(nullif(btrim(p_currency), ''), currency), 4),
@@ -205,6 +302,7 @@ begin
     go_amount = coalesce(p_go, go_amount),
     free_parking = coalesce(p_free_parking, free_parking),
     allow_negative = coalesce(p_allow_negative, allow_negative),
+    require_approval = coalesce(p_require_approval, require_approval),
     rules_notes = left(coalesce(p_rules, rules_notes), 4000)
   where id = p_game;
 end $$;
@@ -221,12 +319,13 @@ begin
   update public.games set host_id = v_user where id = p_game;
 end $$;
 
+-- Returns 'done' when money moved, 'pending' when it's waiting for approval.
 create or replace function public.transfer(
   p_game uuid, p_from_type text, p_from uuid, p_to_type text, p_to uuid,
   p_amount bigint, p_note text default null
-) returns bigint language plpgsql security definer set search_path = '' as $$
+) returns text language plpgsql security definer set search_path = '' as $$
 declare
-  g public.games; v_me uuid; v_host boolean; v_id bigint;
+  g public.games; v_me uuid; v_host boolean; v_own boolean;
 begin
   select * into g from public.games where id = p_game;
   if not found then raise exception 'Game not found'; end if;
@@ -249,54 +348,46 @@ begin
   end if;
 
   v_host := g.host_id = auth.uid();
-  if not v_host then
-    if p_from_type = 'player' then
-      if p_from <> v_me then raise exception 'You can only pay from your own balance'; end if;
-    elsif p_to_type <> 'player' or p_to <> v_me then
-      raise exception 'Only the banker can do that';
+  v_own := p_from_type = 'player' and p_from = v_me;
+
+  -- non-bankers may pay from their own balance, or claim money for themselves
+  if not v_host and not v_own and (p_to_type <> 'player' or p_to <> v_me) then
+    raise exception 'You can only pay from your own balance';
+  end if;
+
+  if not v_own then
+    if g.require_approval then
+      perform public._create_request(p_game, v_me, p_from_type, p_from, p_to_type, p_to, p_amount, p_note, null);
+      return 'pending';
+    end if;
+    if not v_host then
+      if p_from_type = 'player' then raise exception 'Use Request money to ask another player'; end if;
     end if;
   end if;
 
-  perform public._apply_move(p_game, p_from_type, p_from, p_to_type, p_to, p_amount, not v_host);
-
-  insert into public.transactions (game_id, from_type, from_player, to_type, to_player, amount, note, created_by)
-  values (p_game, p_from_type, p_from, p_to_type, p_to, p_amount, nullif(left(btrim(coalesce(p_note, '')), 80), ''), v_me)
-  returning id into v_id;
-  return v_id;
+  perform public._apply_move(p_game, p_from_type, p_from, p_to_type, p_to, p_amount, v_own or not v_host);
+  perform public._record(p_game, p_from_type, p_from, p_to_type, p_to, p_amount, p_note, 'normal', v_me, null, null);
+  return 'done';
 end $$;
 
-create or replace function public.undo_transaction(p_tx bigint)
-returns bigint language plpgsql security definer set search_path = '' as $$
-declare
-  t public.transactions; v_me uuid; v_host boolean; v_id bigint;
+-- Fixed GO payout to yourself; always instant.
+create or replace function public.pass_go(p_game uuid)
+returns text language plpgsql security definer set search_path = '' as $$
+declare v_me uuid; v_go bigint;
 begin
-  select * into t from public.transactions where id = p_tx;
-  if not found then raise exception 'Transaction not found'; end if;
-  select id into v_me from public.players where game_id = t.game_id and user_id = auth.uid();
+  select go_amount into v_go from public.games where id = p_game;
+  if not found then raise exception 'Game not found'; end if;
+  select id into v_me from public.players where game_id = p_game and user_id = auth.uid();
   if v_me is null then raise exception 'You are not in this game'; end if;
-  select host_id = auth.uid() into v_host from public.games where id = t.game_id;
-  if t.kind <> 'normal' then raise exception 'That entry can''t be undone'; end if;
-  if t.created_by is distinct from v_me and not v_host then
-    raise exception 'Only the person who made it (or the banker) can undo it';
-  end if;
-
-  -- lock the game, then re-check so two people can't undo the same thing
-  perform 1 from public.games where id = t.game_id for update;
-  select * into t from public.transactions where id = p_tx;
-  if t.reversed_by is not null then raise exception 'Already undone'; end if;
-
-  perform public._apply_move(t.game_id, t.to_type, t.to_player, t.from_type, t.from_player, t.amount, false);
-  insert into public.transactions (game_id, from_type, from_player, to_type, to_player, amount, note, kind, created_by, reverses)
-  values (t.game_id, t.to_type, t.to_player, t.from_type, t.from_player, t.amount,
-          'Undo' || coalesce(': ' || t.note, ''), 'reversal', v_me, t.id)
-  returning id into v_id;
-  update public.transactions set reversed_by = v_id where id = t.id;
-  return v_id;
+  if v_go <= 0 then raise exception 'Passing GO pays nothing in this game'; end if;
+  perform public._apply_move(p_game, 'bank', null, 'player', v_me, v_go, false);
+  perform public._record(p_game, 'bank', null, 'player', v_me, v_go, 'Passed GO', 'normal', v_me, null, null);
+  return 'done';
 end $$;
 
 create or replace function public.request_payment(p_game uuid, p_payer uuid, p_amount bigint, p_note text default null)
 returns bigint language plpgsql security definer set search_path = '' as $$
-declare v_me uuid; v_id bigint;
+declare v_me uuid;
 begin
   select id into v_me from public.players where game_id = p_game and user_id = auth.uid();
   if v_me is null then raise exception 'You are not in this game'; end if;
@@ -305,16 +396,49 @@ begin
   if not exists (select 1 from public.players where id = p_payer and game_id = p_game) then
     raise exception 'Player not found';
   end if;
-  insert into public.payment_requests (game_id, requester, payer, amount, note)
-  values (p_game, v_me, p_payer, p_amount, nullif(left(btrim(coalesce(p_note, '')), 80), ''))
-  returning id into v_id;
-  return v_id;
+  return public._create_request(p_game, v_me, 'player', p_payer, 'player', v_me, p_amount, p_note, null);
 end $$;
 
--- accept = true pays it; false declines (payer) or cancels (requester)
+create or replace function public.undo_transaction(p_tx bigint)
+returns text language plpgsql security definer set search_path = '' as $$
+declare
+  t public.transactions; g public.games; v_me uuid; v_host boolean;
+begin
+  select * into t from public.transactions where id = p_tx;
+  if not found then raise exception 'Transaction not found'; end if;
+  select * into g from public.games where id = t.game_id;
+  select id into v_me from public.players where game_id = t.game_id and user_id = auth.uid();
+  if v_me is null then raise exception 'You are not in this game'; end if;
+  v_host := g.host_id = auth.uid();
+  if t.kind <> 'normal' then raise exception 'That entry can''t be undone'; end if;
+  if t.created_by is distinct from v_me and not v_host then
+    raise exception 'Only the person who made it (or the banker) can undo it';
+  end if;
+
+  perform 1 from public.games where id = t.game_id for update;
+  select * into t from public.transactions where id = p_tx;
+  if t.reversed_by is not null then raise exception 'Already undone'; end if;
+
+  -- handing back money you received is always fine; anything else needs an OK
+  if g.require_approval and not (t.to_type = 'player' and t.to_player = v_me) then
+    if exists (select 1 from public.payment_requests where reverses = t.id and status = 'pending') then
+      raise exception 'An undo for that is already waiting for approval';
+    end if;
+    perform public._create_request(t.game_id, v_me, t.to_type, t.to_player, t.from_type, t.from_player,
+                                   t.amount, 'Undo' || coalesce(': ' || t.note, ''), t.id);
+    return 'pending';
+  end if;
+
+  perform public._apply_move(t.game_id, t.to_type, t.to_player, t.from_type, t.from_player, t.amount, false);
+  perform public._record(t.game_id, t.to_type, t.to_player, t.from_type, t.from_player, t.amount,
+                         'Undo' || coalesce(': ' || t.note, ''), 'reversal', v_me, null, t.id);
+  return 'done';
+end $$;
+
+-- accept = true approves/pays; false rejects (approver) or cancels (requester)
 create or replace function public.respond_request(p_request bigint, p_accept boolean)
 returns void language plpgsql security definer set search_path = '' as $$
-declare r public.payment_requests; v_me uuid;
+declare r public.payment_requests; v_me uuid; v_can boolean;
 begin
   select * into r from public.payment_requests where id = p_request;
   if not found then raise exception 'Request not found'; end if;
@@ -324,17 +448,23 @@ begin
   perform 1 from public.games where id = r.game_id for update;
   select * into r from public.payment_requests where id = p_request;
   if r.status <> 'pending' then raise exception 'That request was already handled'; end if;
+  v_can := v_me = any (public._approvers(r));
 
   if p_accept then
-    if r.payer <> v_me then raise exception 'Only the payer can pay this'; end if;
-    perform public._apply_move(r.game_id, 'player', r.payer, 'player', r.requester, r.amount, true);
-    insert into public.transactions (game_id, from_type, from_player, to_type, to_player, amount, note, created_by)
-    values (r.game_id, 'player', r.payer, 'player', r.requester, r.amount, r.note, v_me);
-    update public.payment_requests set status = 'paid', resolved_at = now() where id = r.id;
+    if not v_can then raise exception 'You can''t approve this one'; end if;
+    if r.reverses is not null and exists (select 1 from public.transactions where id = r.reverses and reversed_by is not null) then
+      raise exception 'That was already undone';
+    end if;
+    perform public._apply_move(r.game_id, r.from_type, r.from_player, r.to_type, r.to_player, r.amount, r.reverses is null);
+    perform public._record(r.game_id, r.from_type, r.from_player, r.to_type, r.to_player, r.amount, r.note,
+                           case when r.reverses is null then 'normal' else 'reversal' end,
+                           r.requester, v_me, r.reverses);
+    update public.payment_requests set status = 'approved', resolved_by = v_me, resolved_at = now() where id = r.id;
   else
-    if v_me not in (r.payer, r.requester) then raise exception 'Not your request'; end if;
+    if v_me <> r.requester and not v_can then raise exception 'Not your request'; end if;
     update public.payment_requests
-      set status = case when v_me = r.payer then 'declined' else 'cancelled' end, resolved_at = now()
+      set status = case when v_me = r.requester then 'cancelled' else 'rejected' end,
+          resolved_by = v_me, resolved_at = now()
       where id = r.id;
   end if;
 end $$;
@@ -343,23 +473,29 @@ end $$;
 
 revoke all on function public._apply_move(uuid, text, uuid, text, uuid, bigint, boolean) from public, anon, authenticated;
 revoke all on function public._add_player(uuid, text) from public, anon, authenticated;
+revoke all on function public._approvers(public.payment_requests) from public, anon, authenticated;
+revoke all on function public._play_started(uuid) from public, anon, authenticated;
+revoke all on function public._create_request(uuid, uuid, text, uuid, text, uuid, bigint, text, bigint) from public, anon, authenticated;
+revoke all on function public._record(uuid, text, uuid, text, uuid, bigint, text, text, uuid, uuid, bigint) from public, anon, authenticated;
 
 revoke all on function public.is_member(uuid) from public, anon;
-revoke all on function public.create_game(text, text, text, bigint, bigint, boolean, boolean, text) from public, anon;
+revoke all on function public.create_game(text, text, text, bigint, bigint, boolean, boolean, boolean, text) from public, anon;
 revoke all on function public.join_game(text, text) from public, anon;
-revoke all on function public.update_game(uuid, text, text, bigint, bigint, boolean, boolean, text) from public, anon;
+revoke all on function public.update_game(uuid, text, text, bigint, bigint, boolean, boolean, boolean, text) from public, anon;
 revoke all on function public.make_banker(uuid, uuid) from public, anon;
 revoke all on function public.transfer(uuid, text, uuid, text, uuid, bigint, text) from public, anon;
+revoke all on function public.pass_go(uuid) from public, anon;
 revoke all on function public.undo_transaction(bigint) from public, anon;
 revoke all on function public.request_payment(uuid, uuid, bigint, text) from public, anon;
 revoke all on function public.respond_request(bigint, boolean) from public, anon;
 
 grant execute on function public.is_member(uuid) to authenticated;
-grant execute on function public.create_game(text, text, text, bigint, bigint, boolean, boolean, text) to authenticated;
+grant execute on function public.create_game(text, text, text, bigint, bigint, boolean, boolean, boolean, text) to authenticated;
 grant execute on function public.join_game(text, text) to authenticated;
-grant execute on function public.update_game(uuid, text, text, bigint, bigint, boolean, boolean, text) to authenticated;
+grant execute on function public.update_game(uuid, text, text, bigint, bigint, boolean, boolean, boolean, text) to authenticated;
 grant execute on function public.make_banker(uuid, uuid) to authenticated;
 grant execute on function public.transfer(uuid, text, uuid, text, uuid, bigint, text) to authenticated;
+grant execute on function public.pass_go(uuid) to authenticated;
 grant execute on function public.undo_transaction(bigint) to authenticated;
 grant execute on function public.request_payment(uuid, uuid, bigint, text) to authenticated;
 grant execute on function public.respond_request(bigint, boolean) to authenticated;
