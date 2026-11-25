@@ -37,6 +37,34 @@ const store = {
   set(k, v) { try { localStorage.setItem(k, v); } catch { /* ignore */ } },
 };
 
+// hand-drawn line icons (24px grid)
+const ICONS = {
+  back: '<path d="M15 5l-7 7 7 7"/>',
+  share: '<path d="M12 15V3M8 7l4-4 4 4M5 12v7h14v-7"/>',
+  book: '<path d="M5 5.5A2.5 2.5 0 017.5 3H19v15H7.5A2.5 2.5 0 005 20.5zM5 20.5A2.5 2.5 0 007.5 23H19v-5"/>',
+  collect: '<path d="M12 3v11M7 9.5l5 5 5-5M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
+  pay: '<path d="M12 15V4M7 8.5l5-5 5 5M4 15v4a2 2 0 002 2h12a2 2 0 002-2v-4"/>',
+  swap: '<path d="M4 8h14l-4-4M20 16H6l4 4"/>',
+  ask: '<path d="M4 6h16v12H4zM4 7l8 6 8-6"/>',
+  bank: '<path d="M3 9.5L12 4l9 5.5M5 10v8M9.7 10v8M14.3 10v8M19 10v8M3 20.5h18"/>',
+  pot: '<circle cx="12" cy="12" r="9"/><path d="M10 17V7.5h3a2.75 2.75 0 010 5.5h-3"/>',
+  scale: '<path d="M12 4v16M7 20h10M5 7h14M5 7l-2.5 6a2.5 2.5 0 005 0zM19 7l-2.5 6a2.5 2.5 0 005 0z"/>',
+  arrow: '<path d="M5 12h14M13 6l6 6-6 6"/>',
+  undo: '<path d="M9 14L4 9l5-5M4 9h10.5a5.5 5.5 0 010 11H11"/>',
+  del: '<path d="M21 5H9l-6 7 6 7h12zM12.5 9.5l5 5M17.5 9.5l-5 5"/>',
+};
+const icon = (n) => `<svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
+const LOGO = `<svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+  <rect x="4" y="14" width="50" height="32" rx="5" fill="#1d5b3e" transform="rotate(-8 29 30)"/>
+  <rect x="10" y="18" width="50" height="32" rx="5" fill="#fbf8f2" stroke="#1d5b3e" stroke-width="2.5"/>
+  <rect x="14.5" y="22.5" width="41" height="23" rx="3" fill="none" stroke="#1d5b3e" stroke-width="1.2" opacity=".5"/>
+  <circle cx="35" cy="34" r="7.5" fill="#e3b23c"/>
+  <text x="35" y="38.3" text-anchor="middle" font-family="Georgia, serif" font-weight="700" font-size="11" fill="#2b2104">$</text>
+</svg>`;
+// splits "R1,500" so the currency symbol can be styled smaller
+const moneyHTML = (n, g = state.game) =>
+  `${Number(n) < 0 ? '−' : ''}<span class="cur">${esc(g?.currency ?? '$')}</span>${esc(num(n))}`;
+
 // ------------------------------------------------------------------ ui helpers
 
 let toastTimer;
@@ -62,6 +90,7 @@ async function rpc(name, args) {
 
 function openSheet(html) {
   const root = $('#sheet-root');
+  sheetKeys = null;
   root.innerHTML = `<div class="backdrop"></div><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div>`;
   root.hidden = false;
   $('.backdrop', root).onclick = closeSheet;
@@ -71,8 +100,13 @@ function closeSheet() {
   const root = $('#sheet-root');
   root.hidden = true;
   root.innerHTML = '';
+  sheetKeys = null;
 }
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSheet(); });
+let sheetKeys = null; // set by the amount keypad while it's open
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') return closeSheet();
+  if (sheetKeys && !$('#sheet-root').hidden) sheetKeys(e);
+});
 
 function busy(btn, fn) {
   return async (...a) => {
@@ -112,22 +146,22 @@ const go = (hash) => { if (location.hash === hash) route(); else location.hash =
 async function showHome(prefillCode = '') {
   const name = store.get('pb-name') || '';
   app.innerHTML = `
-    <div class="hero">
-      <img src="icon.svg" alt="">
-      <h1>Pocket Banker</h1>
-      <p class="muted">The bank for your board game night</p>
-    </div>
-    <form class="card stack" id="join">
-      <h2>Join a game</h2>
+    <header class="brand">
+      ${LOGO}
+      <div><h1>Pocket Banker</h1><p class="muted">No more paper money all over the table.</p></div>
+    </header>
+    <form class="card stack join" id="join">
+      <div><h2>Join a game</h2><p class="muted small">Ask the banker for the 4-letter code.</p></div>
       <label class="field"><span>Game code</span>
-        <input class="code-input" name="code" maxlength="4" autocomplete="off" autocapitalize="characters" required value="${esc(prefillCode || '')}" placeholder="ABCD"></label>
+        <input class="code-input" name="code" maxlength="4" autocomplete="off" autocapitalize="characters" spellcheck="false" required value="${esc(prefillCode || '')}" placeholder="····"></label>
       <label class="field"><span>Your name</span>
-        <input name="name" maxlength="20" required value="${esc(name)}" autocomplete="nickname" placeholder="e.g. Tyron"></label>
-      <button class="btn primary block big" type="submit">Join game</button>
+        <input name="name" maxlength="20" required value="${esc(name)}" autocomplete="nickname" placeholder="What should the table call you?"></label>
+      <button class="btn primary block big" type="submit">Take a seat</button>
     </form>
-    <div style="margin-top:12px"><a class="btn block" href="#/new">Start a new game (you're the banker)</a></div>
-    <h3>Your games</h3>
-    <div id="mine" class="card list"><p class="muted" style="padding:14px 16px">Loading…</p></div>
+    <div class="or">or</div>
+    <a class="btn block big" href="#/new">${icon('bank')} Start a game and be the banker</a>
+    <div class="section-title"><span>Your games</span></div>
+    <div id="mine" class="card games"><p class="muted" style="padding:14px 16px">Loading…</p></div>
   `;
   const form = $('#join');
   const btn = $('button[type=submit]', form);
@@ -150,11 +184,12 @@ async function showHome(prefillCode = '') {
   const mine = $('#mine');
   if (!mine) return;
   if (error) { mine.innerHTML = `<p class="muted" style="padding:14px 16px">${esc(cleanError(error))}</p>`; return; }
-  if (!data.length) { mine.innerHTML = `<p class="muted" style="padding:14px 16px">No games yet on this phone.</p>`; return; }
+  if (!data.length) { mine.innerHTML = `<p class="muted" style="padding:14px 16px">Nothing yet. Games you join on this phone show up here.</p>`; return; }
   mine.innerHTML = data.map((p) => `
     <a class="game-link" href="#/game/${esc(p.games.code)}">
-      <div class="grow"><strong>${esc(p.games.name)}</strong><div class="muted small">${esc(p.games.code)} · playing as ${esc(p.name)}</div></div>
-      <strong>${esc(money(p.balance, p.games))}</strong>
+      <span class="code">${esc(p.games.code)}</span>
+      <div class="grow"><strong>${esc(p.games.name)}</strong><div class="muted small">as ${esc(p.name)}</div></div>
+      <strong class="num">${esc(money(p.balance, p.games))}</strong>
     </a>`).join('');
 }
 
@@ -198,15 +233,16 @@ function readSettings(form) {
 function showCreate() {
   const name = store.get('pb-name') || '';
   app.innerHTML = `
-    <div class="topbar"><a class="btn ghost icon-btn" href="#/" aria-label="Back">←</a><h1>New game</h1></div>
+    <div class="topbar"><a class="btn ghost icon-btn" href="#/" aria-label="Back">${icon('back')}</a>
+      <div class="title"><h1>New game</h1><div class="sub">You'll be the banker</div></div></div>
     <form class="card stack" id="create">
       <label class="field"><span>Game name</span><input name="game_name" maxlength="40" placeholder="Sunday at Mom & Dad's"></label>
       <label class="field"><span>Your name</span><input name="name" maxlength="20" required value="${esc(name)}"></label>
-      <label class="field"><span>Version preset</span>
+      <label class="field"><span>Which box are you playing?</span>
         <select name="preset">${Object.entries(PRESETS).map(([k, p]) => `<option value="${k}">${esc(p.label)}</option>`).join('')}</select></label>
       ${settingsFields()}
-      <button class="btn primary block big" type="submit">Create game</button>
-      <p class="muted small">You'll be the banker. You can change any of this later from the Rules button.</p>
+      <button class="btn primary block big" type="submit">Open the bank</button>
+      <p class="muted small">Everything except the locked money rules can be changed later under Rules.</p>
     </form>`;
   const form = $('#create');
   $$('.amt', form).forEach(bindAmountInput);
@@ -318,49 +354,53 @@ function renderGame() {
   const rank = (r) => (approversOf(r).includes(me.id) ? 0 : r.requester === me.id ? 1 : 2);
   const pending = [...state.requests].sort((a, b) => rank(a) - rank(b) || a.id - b.id);
 
+  const collectSub = g.require_approval ? (banker ? 'Another player OKs it' : 'The banker OKs it') : 'Cards, sales, payouts';
   app.innerHTML = `
     <div class="topbar">
-      <a class="btn ghost icon-btn" href="#/" aria-label="Home">←</a>
-      <h1 class="grow">${esc(g.name)}</h1>
-      <button class="code-chip" id="share" aria-label="Share game code">${esc(g.code)}</button>
-      <button class="btn icon-btn" id="rules">Rules</button>
+      <a class="btn ghost icon-btn" href="#/" aria-label="All games">${icon('back')}</a>
+      <div class="title"><h1>${esc(g.name)}</h1><div class="sub">${state.players.length} player${state.players.length === 1 ? '' : 's'}${hostPlayer ? ` · ${esc(hostPlayer.name)} is banker` : ''}</div></div>
+      <button class="code-pill" id="share" aria-label="Share game code ${esc(g.code)}">${icon('share')}${esc(g.code)}</button>
+      <button class="btn ghost icon-btn" id="rules" aria-label="Rules">${icon('book')}</button>
     </div>
 
-    <section class="balance-card">
-      <div class="label"><span class="dot" style="background:${esc(me.color)}"></span>${esc(me.name)} ${banker ? '<span class="badge">BANKER</span>' : ''}</div>
-      <div class="amount ${me.balance < 0 ? 'neg' : ''}">${esc(money(me.balance))}</div>
+    <section class="banknote" style="--pc:${esc(me.color)}">
+      <div class="who"><span class="token" style="background:${esc(me.color)}"></span>${esc(me.name)}${banker ? '<span class="stamp">BANKER</span>' : ''}</div>
+      <div class="label">Your balance</div>
+      <div class="amount ${me.balance < 0 ? 'neg' : ''}">${moneyHTML(me.balance)}</div>
     </section>
 
     ${pending.map((r) => requestRow(r)).join('')}
 
-    <div class="actions">
-      <button class="action go" id="a-go"><span class="ico">➜</span><strong>Pass GO</strong><small>+${esc(money(g.go_amount))}</small></button>
-      <button class="action" id="a-collect"><span class="ico">🏦</span><strong>Collect from bank</strong><small>${g.require_approval ? (banker ? 'Another player approves' : 'Banker approves') : 'Get money'}</small></button>
-      <button class="action" id="a-paybank"><span class="ico">💸</span><strong>Pay the bank</strong><small>Buy, tax, fines</small></button>
-      <button class="action" id="a-payplayer"><span class="ico">🤝</span><strong>Pay a player</strong><small>Rent, trades</small></button>
-      <button class="action" id="a-request"><span class="ico">📨</span><strong>Request money</strong><small>They tap to pay</small></button>
-      ${g.free_parking
-        ? `<button class="action" id="a-pot"><span class="ico">🅿️</span><strong>Pot: ${esc(money(g.pot))}</strong><small>Pay in or collect</small></button>`
-        : `<button class="action" id="a-history"><span class="ico">🧾</span><strong>My history</strong><small>Jump to activity</small></button>`}
-      ${banker ? `<button class="action wide" id="a-banker"><span class="ico">⚖️</span><span><strong>Banker: move money</strong><br><small>Between anyone, the bank${g.free_parking ? ' or the pot' : ''}</small></span></button>` : ''}
+    <button class="go-btn" id="a-go">
+      <span><span class="go">GO</span><div class="go-sub">Passed it? Collect.</div></span>
+      <span class="go-amt">+${esc(money(g.go_amount))}</span>
+    </button>
+    <div class="tiles">
+      <button class="tile in" id="a-collect"><span class="ic">${icon('collect')}</span><span><strong>Collect from bank</strong><small>${esc(collectSub)}</small></span></button>
+      <button class="tile out" id="a-paybank"><span class="ic">${icon('pay')}</span><span><strong>Pay the bank</strong><small>Buy, build, tax, fines</small></span></button>
+      <button class="tile" id="a-payplayer"><span class="ic">${icon('swap')}</span><span><strong>Pay a player</strong><small>Rent, trades</small></span></button>
+      <button class="tile req" id="a-request"><span class="ic">${icon('ask')}</span><span><strong>Ask for money</strong><small>They tap to pay you</small></span></button>
     </div>
+    ${g.free_parking ? `<button class="wide-btn" id="a-pot"><span class="ic">${icon('pot')}</span><span><strong>Free Parking pot</strong><small>Pay in or collect</small></span><span class="val">${esc(money(g.pot))}</span></button>` : ''}
+    ${banker ? `<button class="wide-btn" id="a-banker"><span class="ic">${icon('scale')}</span><span><strong>Banker desk</strong><small>Move money between anyone${g.require_approval ? ' (needs an OK)' : ''}</small></span></button>` : ''}
 
-    <h3>Players</h3>
-    <div class="card players">
+    <div class="section-title"><span>At the table</span><span>tap a player</span></div>
+    <div class="deeds">
       ${state.players.map((p) => `
-        <button class="player ${p.id === me.id ? 'me' : ''}" data-player="${p.id}">
-          <span class="dot" style="background:${esc(p.color)}"></span>
-          <span class="grow">${esc(p.name)}${p.id === me.id ? ' <span class="muted small">(you)</span>' : ''} ${p.user_id === g.host_id ? '<span class="badge">BANKER</span>' : ''}</span>
-          <span class="bal ${p.balance < 0 ? 'neg' : ''}">${esc(money(p.balance))}</span>
+        <button class="deed ${p.id === me.id ? 'me' : ''}" style="--pc:${esc(p.color)}" data-player="${p.id}">
+          <div class="band">${esc(p.name)}</div>
+          <div class="body">
+            <span class="bal ${p.balance < 0 ? 'neg' : ''}">${esc(money(p.balance))}</span>
+            ${p.user_id === g.host_id ? '<span class="stamp sm">BANKER</span>' : p.id === me.id ? '<span class="you">You</span>' : ''}
+          </div>
         </button>`).join('')}
     </div>
-    ${state.players.length < 2 ? `<p class="muted small" style="margin-top:8px">Share the code <strong>${esc(g.code)}</strong> so others can join.</p>` : ''}
+    ${state.players.length < 2 ? `<p class="muted small" style="margin-top:10px">Nobody else yet. Tap <strong>${esc(g.code)}</strong> at the top to send the invite.</p>` : ''}
 
-    <h3 id="activity">Activity</h3>
-    <div class="card feed">
+    <div class="section-title" id="activity"><span>Ledger</span></div>
+    <div class="card ledger">
       ${state.txs.length ? state.txs.map(txRow).join('') : '<p class="muted" style="padding:14px 16px">Nothing yet.</p>'}
     </div>
-    ${!hostPlayer ? '' : `<p class="muted small" style="margin-top:12px;text-align:center">${esc(hostPlayer.name)} is the banker.</p>`}
   `;
 
   $('#share').onclick = shareCode;
@@ -377,7 +417,6 @@ function renderGame() {
   $('#a-payplayer').onclick = () => payPlayerSheet();
   $('#a-request').onclick = () => requestSheet();
   $('#a-pot')?.addEventListener('click', potSheet);
-  $('#a-history')?.addEventListener('click', () => $('#activity').scrollIntoView({ behavior: 'smooth' }));
   $('#a-banker')?.addEventListener('click', () => bankerSheet());
   $$('[data-player]').forEach((b) => (b.onclick = () => playerSheet(b.dataset.player)));
   $$('[data-approve-req]').forEach((b) => (b.onclick = busy(b, async () => {
@@ -431,17 +470,20 @@ function requestRow(r) {
   let waiting = '';
   if (!canApprove) {
     const names = approvers.map((id) => partyName('player', id));
-    waiting = `<div class="small" style="opacity:.8">Waiting for ${esc(
+    waiting = `<div class="wait">Waiting for ${esc(
       !names.length ? 'another player to join' : names.length === 1 ? names[0] : names.length > 2 ? 'any other player' : names.join(' or ')
     )}</div>`;
   }
-  const approveLabel = r.from_type === 'player' && r.from_player === me.id && !r.reverses ? 'Pay' : 'Approve';
+  const isPay = r.from_type === 'player' && r.from_player === me.id && !r.reverses;
+  const acts = canApprove
+    ? `<button class="btn primary" data-approve-req="${r.id}">${isPay ? `Pay ${esc(money(r.amount))}` : 'Approve'}</button>
+       <button class="btn" data-reject-req="${r.id}">${isPay ? 'Decline' : 'Reject'}</button>`
+    : mine ? `<button class="btn" data-reject-req="${r.id}">Cancel request</button>` : '';
   return `
-    <div class="request">
-      <div class="grow">${text}${note}${waiting}</div>
-      ${canApprove ? `<button class="btn primary" data-approve-req="${r.id}">${approveLabel}</button>
-                      <button class="btn" data-reject-req="${r.id}" aria-label="Reject">✕</button>` : ''}
-      ${mine && !canApprove ? `<button class="btn" data-reject-req="${r.id}">Cancel</button>` : ''}
+    <div class="slip ${canApprove ? 'mine-to-act' : ''}">
+      <div class="what">${text}${note}</div>
+      ${waiting}
+      ${acts ? `<div class="acts">${acts}</div>` : ''}
     </div>`;
 }
 
@@ -456,13 +498,13 @@ function txRow(t) {
   const undoPending = state.requests.some((r) => r.reverses === t.id);
   const canUndo = t.kind === 'normal' && !t.reversed_by && !undoPending && (t.created_by === me.id || isBanker());
   return `
-    <div class="tx ${t.reversed_by ? 'reversed' : ''}">
+    <div class="entry ${t.reversed_by ? 'reversed' : ''}">
       <div class="grow">
-        <div class="who">${esc(partyName(t.from_type, t.from_player))} → ${esc(partyName(t.to_type, t.to_player))}</div>
-        <div class="muted small">${esc(t.note || '')}${t.note ? ' · ' : ''}${esc(timeAgo(t.created_at))}${esc(byLine)}</div>
+        <div class="flow"><span>${esc(partyName(t.from_type, t.from_player))}</span>${icon('arrow')}<span>${esc(partyName(t.to_type, t.to_player))}</span></div>
+        <div class="meta">${esc(t.note || '')}${t.note ? ' · ' : ''}${esc(timeAgo(t.created_at))}${esc(byLine)}</div>
       </div>
       <div class="amt ${inbound ? 'in' : outbound ? 'out' : ''}">${inbound ? '+' : outbound ? '−' : ''}${esc(money(t.amount))}</div>
-      ${canUndo ? `<button class="btn undo" data-undo="${t.id}">Undo</button>` : ''}
+      ${canUndo ? `<button class="undo" data-undo="${t.id}" aria-label="Undo">${icon('undo')}</button>` : ''}
     </div>`;
 }
 
@@ -510,49 +552,95 @@ function amountSheet({ title, confirm, notes = [], pick = null, pickLabel = 'Who
     <form class="stack" id="amt-form">
       <h2>${esc(title)}</h2>
       ${pick ? `
-        <div><div class="muted small" style="margin-bottom:6px">${esc(pickLabel)}</div>
+        <div><div class="muted small" style="margin-bottom:8px">${esc(pickLabel)}</div>
         <div class="pick">${pick.map((p) => `
           <button type="button" class="chip ${p.id === preselect ? 'on' : ''}" data-pick="${p.id}">
-            <span class="dot" style="background:${esc(p.color)}"></span>${esc(p.name)}</button>`).join('')}</div></div>` : ''}
+            <span class="token" style="background:${esc(p.color)}"></span>${esc(p.name)}</button>`).join('')}</div></div>` : ''}
       ${parties ? `
         <div class="grid-2">
           <label class="field"><span>From</span><select name="from">${partyOpts(preselect?.from ?? 'bank:')}</select></label>
           <label class="field"><span>To</span><select name="to">${partyOpts(preselect?.to ?? `player:${state.players[0]?.id}`)}</select></label>
         </div>` : ''}
-      <label class="amount-field"><span>${esc(g.currency)}</span>
-        <input name="amount" inputmode="numeric" autocomplete="off" placeholder="0" value="${amount ? esc(num(amount)) : ''}" aria-label="Amount"></label>
-      <div class="chips">
+      <div class="display" aria-live="polite"><span class="cur">${esc(g.currency)}</span><span class="val">0</span></div>
+      <div class="note-row">
         ${quickChips(g).map((c) => `<button type="button" class="chip" data-add="${c}">+${esc(num(c))}</button>`).join('')}
-        <button type="button" class="chip" data-clear>Clear</button>
       </div>
-      <input name="note" maxlength="60" placeholder="Note (optional)">
-      ${notes.length ? `<div class="chips">${notes.map((n) => `<button type="button" class="chip" data-note="${esc(n)}">${esc(n)}</button>`).join('')}</div>` : ''}
+      <div class="keypad">
+        ${[1, 2, 3, 4, 5, 6, 7, 8, 9].map((d) => `<button type="button" class="key" data-key="${d}">${d}</button>`).join('')}
+        <button type="button" class="key" data-key="000">000</button>
+        <button type="button" class="key" data-key="0">0</button>
+        <button type="button" class="key fn" data-key="del" aria-label="Delete">${icon('del')}</button>
+      </div>
+      <div class="note-row">
+        ${notes.map((n) => `<button type="button" class="chip" data-note="${esc(n)}">${esc(n)}</button>`).join('')}
+        <button type="button" class="chip" data-note-other>${notes.length ? 'Other…' : 'Add a note'}</button>
+      </div>
+      <input name="note" maxlength="60" placeholder="What's it for?" hidden>
       <button class="btn primary block big" type="submit">${esc(confirm)}</button>
     </form>`);
 
   const form = $('#amt-form', el);
-  const amt = form.amount;
-  bindAmountInput(amt);
+  const display = $('.display', el);
+  let value = amount || 0;
+  const MAX = 999999999999;
+  const submitBtn = $('button[type=submit]', form);
+  const show = () => {
+    $('.val', display).textContent = num(value);
+    display.classList.toggle('empty', !value);
+    submitBtn.textContent = value ? `${confirm} ${money(value)}` : confirm;
+  };
+  const press = (k) => {
+    if (k === 'del') value = Math.floor(value / 10);
+    else if (k === 'clear') value = 0;
+    else {
+      const next = Number(String(value || '') + k);
+      if (next <= MAX) value = next;
+    }
+    show();
+  };
+  show();
+  $$('[data-key]', el).forEach((b) => (b.onclick = () => press(b.dataset.key)));
+  // long-press delete clears
+  const delKey = $('[data-key="del"]', el);
+  let holdTimer;
+  delKey.addEventListener('pointerdown', () => { holdTimer = setTimeout(() => press('clear'), 500); });
+  ['pointerup', 'pointerleave', 'pointercancel'].forEach((ev) => delKey.addEventListener(ev, () => clearTimeout(holdTimer)));
+  // physical keyboard support (desktop)
+  sheetKeys = (e) => {
+    if (e.target.matches('input, textarea, select')) return;
+    if (/^\d$/.test(e.key)) { press(e.key); e.preventDefault(); }
+    else if (e.key === 'Backspace') { press('del'); e.preventDefault(); }
+    else if (e.key === 'Enter') { form.requestSubmit(); e.preventDefault(); }
+  };
+
   let picked = pick ? preselect : null;
   $$('[data-pick]', el).forEach((b) => (b.onclick = () => {
     picked = b.dataset.pick;
     $$('[data-pick]', el).forEach((x) => x.classList.toggle('on', x === b));
   }));
   $$('[data-add]', el).forEach((b) => (b.onclick = () => {
-    amt.value = (parseAmount(amt.value) + Number(b.dataset.add)).toLocaleString('en-US');
+    value = Math.min(MAX, value + Number(b.dataset.add));
+    show();
   }));
-  $('[data-clear]', el).onclick = () => { amt.value = ''; amt.focus(); };
   $$('[data-note]', el).forEach((b) => (b.onclick = () => {
-    form.note.value = b.dataset.note;
-    $$('[data-note]', el).forEach((x) => x.classList.toggle('on', x === b));
+    const on = !b.classList.contains('on');
+    form.note.value = on ? b.dataset.note : '';
+    form.note.hidden = true;
+    $$('[data-note], [data-note-other]', el).forEach((x) => x.classList.toggle('on', on && x === b));
   }));
-  if (!pick && !parties) setTimeout(() => amt.focus(), 50);
+  $('[data-note-other]', el).onclick = (e) => {
+    $$('[data-note]', el).forEach((x) => x.classList.remove('on'));
+    e.currentTarget.classList.add('on');
+    form.note.value = '';
+    form.note.hidden = false;
+    form.note.focus();
+  };
 
   const btn = $('button[type=submit]', form);
   form.onsubmit = (e) => {
     e.preventDefault();
     busy(btn, async () => {
-      const a = parseAmount(amt.value);
+      const a = value;
       if (!a) { toast('Enter an amount', 'error'); return; }
       if (pick && !picked) { toast('Choose a player', 'error'); return; }
       let extra = {};
@@ -584,7 +672,7 @@ function requestSheet(preselect = null) {
   const others = state.players.filter((p) => p.id !== state.me.id);
   if (!others.length) return toast('No one else has joined yet', 'error');
   amountSheet({
-    title: 'Request money', confirm: 'Send request', pick: others, pickLabel: 'Request from?', notes: NOTES.request,
+    title: 'Ask for money', confirm: 'Send request', pick: others, pickLabel: 'Who owes you?', notes: NOTES.request,
     preselect: preselect ?? (others.length === 1 ? others[0].id : null),
     submit: (a, note, payer) => rpc('request_payment', { p_game: state.game.id, p_payer: payer, p_amount: a, p_note: note || null }),
     done: (a, payer) => `Asked ${partyName('player', payer)} for ${money(a)}`,
@@ -626,14 +714,14 @@ function playerSheet(pid) {
   const self = p.id === me.id;
   const el = openSheet(`
     <div class="stack">
-      <div class="row"><span class="dot" style="background:${esc(p.color)}"></span><h2 class="grow">${esc(p.name)}</h2><strong>${esc(money(p.balance))}</strong></div>
+      <div class="sheet-head"><span class="token" style="background:${esc(p.color)}"></span><h2 class="grow">${esc(p.name)}</h2><strong class="num" style="font-size:1.3rem">${esc(money(p.balance))}</strong></div>
       ${self ? '' : `
-        <button class="btn primary block big" id="p-pay">Pay ${esc(p.name)}</button>
-        <button class="btn block big" id="p-req">Request from ${esc(p.name)}</button>`}
+        <button class="btn primary block big" id="p-pay">${icon('swap')} Pay ${esc(p.name)}</button>
+        <button class="btn block big" id="p-req">${icon('ask')} Ask ${esc(p.name)} for money</button>`}
       ${banker ? `
-        <h3 style="margin-top:16px">Banker</h3>
-        <button class="btn block" id="p-give">Give from bank</button>
-        <button class="btn block" id="p-take">Take to bank</button>
+        <div class="section-title"><span>Banker desk</span>${g.require_approval ? '<span>needs an OK</span>' : ''}</div>
+        <button class="btn block" id="p-give">${icon('collect')} Give from the bank</button>
+        <button class="btn block" id="p-take">${icon('pay')} Take back to the bank</button>
         ${!self ? `<button class="btn block" id="p-host">Make ${esc(p.name)} the banker</button>` : ''}` : ''}
       ${self && !banker ? `<p class="muted">That's you. Use the buttons on the main screen to move money.</p>` : ''}
     </div>`);
@@ -669,7 +757,7 @@ function rulesSheet() {
         <dt>Free Parking pot</dt><dd>${g.free_parking ? 'On' : 'Off'}</dd>
         <dt>Negative balances</dt><dd>${g.allow_negative ? 'Allowed' : 'Not allowed'}</dd>
       </dl>
-      <h3>House rules</h3>
+      <div class="section-title"><span>House rules</span></div>
       <div class="rules-text">${g.rules_notes ? esc(g.rules_notes) : '<span class="muted">None written yet.</span>'}</div>
       ${banker ? '<button class="btn block" id="edit-rules">Edit rules</button>' : '<p class="muted small">Only the banker can change these.</p>'}
     </div>`;
